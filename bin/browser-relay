@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
+import { LOG_FILE, TOKEN_FILE, loadToken, relayUrl } from '../src/config.mjs';
+
+const USAGE = `browser-relay <command>
+
+  serve        run the relay in the foreground
+  mcp          run the MCP server on stdio (starts the relay if needed)
+  token        print the token to paste into the extension options (--copy to use the clipboard)
+  status       show whether the relay and extension are connected
+  stop         stop a running relay
+
+Token: ${TOKEN_FILE}
+Log:   ${LOG_FILE}`;
+
+const [command, ...args] = process.argv.slice(2);
+const auth = () => ({ authorization: `Bearer ${loadToken()}` });
+
+switch (command) {
+  case 'serve': {
+    const { startRelay } = await import('../src/relay.mjs');
+    await startRelay();
+    break;
+  }
+  case 'mcp': {
+    const { startMcpServer } = await import('../src/mcp.mjs');
+    startMcpServer();
+    break;
+  }
+  case 'token': {
+    const token = loadToken();
+    if (args.includes('--copy')) {
+      execFileSync('pbcopy', { input: token });
+      console.log('Token copied to the clipboard.');
+    } else {
+      console.log(token);
+    }
+    break;
+  }
+  case 'status': {
+    try {
+      const res = await fetch(relayUrl('/health'), { headers: auth(), signal: AbortSignal.timeout(1000) });
+      console.log(res.ok ? JSON.stringify(await res.json()) : `relay answered ${res.status}`);
+    } catch {
+      console.log('relay not running');
+      process.exitCode = 1;
+    }
+    break;
+  }
+  case 'stop': {
+    try {
+      await fetch(relayUrl('/shutdown'), { method: 'POST', headers: auth(), signal: AbortSignal.timeout(1000) });
+      console.log('relay stopped');
+    } catch {
+      console.log('relay not running');
+    }
+    break;
+  }
+  default:
+    console.log(USAGE);
+    process.exitCode = command ? 1 : 0;
+}

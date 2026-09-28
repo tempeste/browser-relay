@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Relay</title>
+    <style>
+      body { font: 13px system-ui, sans-serif; margin: 16px; min-width: 360px; }
+      label { display: block; margin: 10px 0 4px; font-weight: 600; }
+      input { width: 100%; box-sizing: border-box; padding: 6px; font-family: ui-monospace, monospace; }
+      button { margin-top: 12px; padding: 6px 14px; }
+      p { color: #555; }
+    </style>
+  </head>
+  <body>
+    <p>Run <code>browser-relay token</code> in a terminal and paste the result here.</p>
+    <label for="token">Relay token</label>
+    <input id="token" type="password" autocomplete="off" />
+    <label for="port">Relay port</label>
+    <input id="port" type="number" placeholder="19988" />
+    <button id="save">Save</button>
+    <span id="status"></span>
+    <script src="options.js"></script>
+  </body>
+</html>

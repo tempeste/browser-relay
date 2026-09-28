@@ -1,0 +1,16 @@
+{
+  "name": "browser-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Drive tabs in your own Chrome from local agents, via a self-owned extension and a 127.0.0.1 relay.",
+  "type": "module",
+  "bin": { "browser-relay": "bin/browser-relay" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node test/e2e.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0",
+    "ws": "8.22.0"
+  }
+}
