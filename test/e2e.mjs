@@ -78,14 +78,49 @@ try {
   await waitUntil(async () => (await health()).extension, 'extension connected');
   console.log('ok  extension connected');
 
+  // A restart can race with the startup alarm or a settings change. Only one
+  // replacement socket should be opened, or the older socket can kill the new
+  // socket's keepalive timer when the relay replaces it.
+  const connectionAttempts = await sw.evaluate(async () => {
+    const OriginalWebSocket = WebSocket;
+    let attempts = 0;
+    globalThis.WebSocket = class extends OriginalWebSocket {
+      constructor(...args) {
+        super(...args);
+        attempts++;
+      }
+    };
+    try {
+      ws.close();
+      await Promise.all([connect(), connect()]);
+      return attempts;
+    } finally {
+      globalThis.WebSocket = OriginalWebSocket;
+    }
+  });
+  assert.equal(connectionAttempts, 1, 'simultaneous reconnects should open one socket');
+  await waitUntil(async () => (await health()).extension, 'extension reconnected');
+  console.log('ok  simultaneous reconnects open one socket');
+
   const userTab = testBrowser.pages()[0] ?? (await testBrowser.newPage());
   await userTab.goto(siteUrl('attached-by-user'));
-  await sw.evaluate(async () => {
+  const userTabId = await sw.evaluate(async () => {
     const [tab] = await chrome.tabs.query({ active: true });
+    const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+    await chrome.tabGroups.update(groupId, { title: 'Research', color: 'blue' });
     await toggle(tab.id);
+    return tab.id;
   });
   await waitUntil(async () => (await health()).tabs === 1, 'tab attached');
-  console.log('ok  toolbar toggle attaches the tab');
+  const marker = async (tabId) => sw.evaluate(async (id) => {
+    const tab = await chrome.tabs.get(id);
+    const group = tab.groupId === -1 ? null : await chrome.tabGroups.get(tab.groupId);
+    return { groupId: tab.groupId, title: group?.title, color: group?.color, pinned: tab.pinned };
+  }, tabId);
+  const userMarker = await marker(userTabId);
+  assert.equal(userMarker.title, 'Browser Relay');
+  assert.equal(userMarker.color, 'orange');
+  console.log('ok  toolbar toggle attaches and visibly groups the tab');
 
   // 3. MCP server drives the attached tab and opens a new one.
   const mcp = spawn(process.execPath, [join(ROOT, 'bin/browser-relay'), 'mcp'], { env, stdio: ['pipe', 'pipe', 'inherit'] });
@@ -108,7 +143,9 @@ try {
   assert.match(created[0].text, /pages 2/);
   assert.match(created[0].text, /opened-by-agent/);
   assert.equal((await health()).tabs, 2);
-  console.log('ok  context.newPage opens and attaches a new tab');
+  const agentTabId = await sw.evaluate((userId) => [...attached.keys()].find((id) => id !== userId), userTabId);
+  assert.equal((await marker(agentTabId)).groupId, userMarker.groupId);
+  console.log('ok  context.newPage opens and marks a new tab in the relay group');
 
   assert.match((await exec(`state.n = (state.n ?? 0) + 1; return page.url()`))[0].text, /opened-by-agent/);
   assert.match((await exec(`return state.n`))[0].text, /Return value: 1/);
@@ -151,6 +188,38 @@ try {
   await call('tools/call', { name: 'reset', arguments: {} });
   assert.match((await exec('return await page.title()'))[0].text, /outer/);
   console.log('ok  extension reconnects after a relay restart');
+
+  await sw.evaluate((id) => toggle(id), userTabId);
+  await waitUntil(async () => (await marker(userTabId)).title === 'Research', 'original group restored');
+  assert.equal((await marker(userTabId)).color, 'blue');
+  await waitUntil(async () => (await health()).tabs === 0, 'tab detached');
+  console.log('ok  detach restores a previous group that Chrome removed while empty');
+
+  // Pinned and ungrouped tabs also return to their original state.
+  const pinnedTabId = await sw.evaluate(async () => {
+    const tab = await chrome.tabs.create({ url: 'about:blank', active: false, pinned: true });
+    await toggle(tab.id);
+    return tab.id;
+  });
+  assert.equal((await marker(pinnedTabId)).title, 'Browser Relay');
+  assert.equal((await marker(pinnedTabId)).pinned, false);
+  await sw.evaluate((id) => toggle(id), pinnedTabId);
+  await waitUntil(async () => (await marker(pinnedTabId)).pinned, 'original pinned state restored');
+  assert.equal((await marker(pinnedTabId)).groupId, -1);
+  await sw.evaluate((id) => chrome.tabs.remove(id), pinnedTabId);
+  console.log('ok  detach restores pinned and ungrouped tabs');
+
+  const movedTabId = await sw.evaluate(async () => {
+    const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+    await toggle(tab.id);
+    await chrome.windows.create({ tabId: tab.id, focused: false });
+    return tab.id;
+  });
+  await waitUntil(async () => (await marker(movedTabId)).title === 'Browser Relay', 'tab marked in new window');
+  await sw.evaluate((id) => toggle(id), movedTabId);
+  await waitUntil(async () => (await marker(movedTabId)).groupId === -1, 'moved tab ungrouped');
+  await sw.evaluate((id) => chrome.tabs.remove(id), movedTabId);
+  console.log('ok  controlled tabs remain marked when moved to another window');
 
   console.log('\nall checks passed');
 } finally {

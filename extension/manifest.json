@@ -3,7 +3,7 @@
   "name": "Browser Relay",
   "version": "0.1.0",
   "description": "Lets local agents drive the tabs you attach, through a relay on 127.0.0.1. Nothing is sent anywhere else.",
-  "permissions": ["debugger", "storage", "alarms"],
+  "permissions": ["debugger", "storage", "alarms", "tabGroups"],
   "background": { "service_worker": "background.js" },
   "action": { "default_title": "Browser Relay: click to attach this tab" },
   "options_ui": { "page": "options.html", "open_in_tab": false },
