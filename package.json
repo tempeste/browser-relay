@@ -1,6 +1,7 @@
 {
   "name": "browser-relay",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "Drive tabs in your own Chrome from local agents, via a self-owned extension and a 127.0.0.1 relay.",
   "type": "module",

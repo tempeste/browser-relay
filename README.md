@@ -89,3 +89,11 @@ The test uses a throwaway Chromium profile, token and port (19989), so your real
 - reconnecting after the relay restarts.
 
 It needs a Chromium that accepts `--load-extension`, which branded Chrome no longer does. By default it uses the newest one in the Playwright cache, or set `BROWSER_RELAY_TEST_CHROMIUM`.
+
+## License
+
+[MIT](LICENSE), copyright 2026 tempeste.
+
+## Acknowledgements
+
+Inspired by [Playwriter](https://github.com/remorses/playwriter).
