@@ -13,6 +13,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import WebSocket from 'ws';
+import { checkSessions } from './sessions.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const PORT = 19989;
@@ -73,7 +74,7 @@ try {
     args: [`--disable-extensions-except=${ext}`, `--load-extension=${ext}`],
   });
   cleanup.unshift(() => testBrowser.close());
-  const sw = testBrowser.serviceWorkers()[0] ?? (await testBrowser.waitForEvent('serviceworker'));
+  let sw = testBrowser.serviceWorkers()[0] ?? (await testBrowser.waitForEvent('serviceworker'));
   await sw.evaluate(({ token, port }) => chrome.storage.local.set({ token, port }), { token, port: PORT });
   await waitUntil(async () => (await health()).extension, 'extension connected');
   console.log('ok  extension connected');
@@ -129,10 +130,25 @@ try {
   const init = await call('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
   assert.equal(init.serverInfo.name, 'browser-relay');
   const { tools } = await call('tools/list');
-  assert.deepEqual(tools.map((t) => t.name), ['execute', 'reset']);
+  assert.deepEqual(tools.map((t) => t.name), ['session', 'execute', 'reset']);
 
+  const sessionCall = async (args) => {
+    const result = await call('tools/call', { name: 'session', arguments: args });
+    if (result.isError) throw new Error(result.content[0].text);
+    return JSON.parse(result.content[0].text);
+  };
+  const sessionA = await sessionCall({ action: 'create', name: 'Checkout test' });
+  assert.equal(await upgradeStatus('/cdp', { authorization: `Bearer ${token}` }), 403, 'CDP requires session identity');
+  assert.match((await call('tools/call', { name: 'execute', arguments: { code: 'return page' } })).content[0].text, /sessionId is required/);
+  const available = await sessionCall({ action: 'list' });
+  assert.equal(available.tabs[0].tabId, userTabId);
+  const beforeClaim = await call('tools/call', { name: 'execute', arguments: { sessionId: sessionA.id, code: 'return [page, context.pages().length]' } });
+  assert.match(beforeClaim.content[0].text, /null, 0/);
+  await sessionCall({ action: 'claim', sessionId: sessionA.id, tabId: userTabId });
+  const claimedMarker = await marker(userTabId);
+  assert.equal(claimedMarker.title, 'Browser Relay · Checkout test');
   const exec = async (code) => {
-    const res = await call('tools/call', { name: 'execute', arguments: { code } });
+    const res = await call('tools/call', { name: 'execute', arguments: { sessionId: sessionA.id, code } });
     if (res.isError) throw new Error(res.content[0].text);
     return res.content;
   };
@@ -144,7 +160,7 @@ try {
   assert.match(created[0].text, /opened-by-agent/);
   assert.equal((await health()).tabs, 2);
   const agentTabId = await sw.evaluate((userId) => [...attached.keys()].find((id) => id !== userId), userTabId);
-  assert.equal((await marker(agentTabId)).groupId, userMarker.groupId);
+  assert.equal((await marker(agentTabId)).groupId, claimedMarker.groupId);
   console.log('ok  context.newPage opens and marks a new tab in the relay group');
 
   assert.match((await exec(`state.n = (state.n ?? 0) + 1; return page.url()`))[0].text, /opened-by-agent/);
@@ -160,7 +176,7 @@ try {
   await waitUntil(async () => (await health()).tabs === 1, 'agent tab closed');
   console.log('ok  page.close closes the tab');
 
-  const err = await call('tools/call', { name: 'execute', arguments: { code: 'throw new Error("boom")' } });
+  const err = await call('tools/call', { name: 'execute', arguments: { sessionId: sessionA.id, code: 'throw new Error("boom")' } });
   assert.equal(err.isError, true);
   console.log('ok  errors are reported, not fatal');
 
@@ -173,11 +189,34 @@ try {
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(req.url === '/?frame' ? `<title>outer</title><iframe src="${innerUrl}"></iframe>` : `<title>inner</title><p id="x">inside ${req.url}</p>`);
   });
+  await sw.evaluate(() => {
+    globalThis.testChildSession = null;
+    chrome.debugger.onEvent.addListener((_source, method, params) => {
+      if (method === 'Target.attachedToTarget') globalThis.testChildSession = params.sessionId;
+    });
+  });
   const frameText = await exec(
     `setPage(null); await page.goto(${JSON.stringify(framed)}); const f = page.frames().find(f => f.url().includes('inner-frame')); return await f.locator('#x').textContent()`,
   );
   assert.match(frameText[0].text, /inside \/inner-frame/);
   console.log('ok  cross-site iframes work through nested sessions');
+
+  const restartWorker = async () => {
+    const cdp = await testBrowser.newCDPSession(userTab);
+    const versions = new Map();
+    cdp.on('ServiceWorker.workerVersionUpdated', ({ versions: changed }) => changed.forEach((v) => versions.set(v.versionId, v)));
+    await cdp.send('ServiceWorker.enable');
+    await waitUntil(async () => [...versions.values()].some((v) => v.scriptURL === sw.url()), 'extension worker version');
+    const version = [...versions.values()].find((v) => v.scriptURL === sw.url());
+    await sw.evaluate(() => { globalThis.testBootMarker = 'before-stop'; });
+    await cdp.send('ServiceWorker.stopWorker', { versionId: version.versionId });
+    await cdp.send('ServiceWorker.startWorker', { scopeURL: sw.url().replace('background.js', '') });
+    await waitUntil(async () => sw.evaluate(async () => { await ready; return globalThis.testBootMarker === undefined && attached.size === 3; }), 'fresh worker execution context');
+    await waitUntil(async () => (await health()).extension && (await health()).tabs === 3, 'worker restored owned tabs');
+    await cdp.detach();
+    return sw;
+  };
+  await checkSessions({ ROOT, env, PORT, token, call, cleanup, sw, sessionA, userTabId, marker, sessionCall, exec, siteUrl, restartWorker });
 
   // The extension reconnects to a restarted relay and re-announces its tabs.
   relay.kill();
@@ -185,8 +224,9 @@ try {
   const relay2 = spawn(process.execPath, [join(ROOT, 'bin/browser-relay'), 'serve'], { env, stdio: ['ignore', 'inherit', 'inherit'] });
   cleanup.push(() => relay2.kill());
   await waitUntil(async () => (await health()).extension && (await health()).tabs === 1, 'extension back with its tab');
-  await call('tools/call', { name: 'reset', arguments: {} });
+  await call('tools/call', { name: 'reset', arguments: { sessionId: sessionA.id } });
   assert.match((await exec('return await page.title()'))[0].text, /outer/);
+  assert.match((await exec("const f = page.frames().find(f => f.url().includes('inner-frame')); return await f.locator('#x').textContent()"))[0].text, /inside \/inner-frame/);
   console.log('ok  extension reconnects after a relay restart');
 
   await sw.evaluate((id) => toggle(id), userTabId);

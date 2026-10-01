@@ -2,7 +2,7 @@
 // Keep the previous grouping in session storage so detaching can put tabs back.
 class RelayTabMarkers {
   placements = new Map();
-  groups = new Set();
+  groups = new Map(); // groupId -> owner ID, or null for unclaimed tabs
   restoredGroups = new Map();
   queue = Promise.resolve();
 
@@ -12,21 +12,21 @@ class RelayTabMarkers {
     return result;
   }
 
-  restore(tabIds) {
+  restore(tabIds, owners = new Map()) {
     return this.run(async () => {
       const { tabMarkers = {} } = await chrome.storage.session.get('tabMarkers');
       this.placements = new Map(tabMarkers.placements ?? []);
-      this.groups = new Set(tabMarkers.groups ?? []);
+      this.groups = new Map((tabMarkers.groups ?? []).map((entry) => Array.isArray(entry) ? entry : [entry, null]));
       this.restoredGroups = new Map(tabMarkers.restoredGroups ?? []);
       for (const tabId of this.placements.keys()) {
         if (!tabIds.includes(tabId)) await this.unmarkTab(tabId);
       }
-      for (const tabId of tabIds) await this.markTab(tabId);
+      for (const tabId of tabIds) await this.markTab(tabId, owners.get(tabId));
     });
   }
 
-  mark(tabId) {
-    return this.run(() => this.markTab(tabId));
+  mark(tabId, owner) {
+    return this.run(() => this.markTab(tabId, owner));
   }
 
   unmark(tabId) {
@@ -43,20 +43,21 @@ class RelayTabMarkers {
     });
   }
 
-  async markTab(tabId) {
+  async markTab(tabId, owner = null) {
+    const ownerId = owner?.id ?? null;
     const tab = await chrome.tabs.get(tabId);
     if (!this.placements.has(tabId)) {
       const originalGroup = tab.groupId === -1 ? null : await chrome.tabGroups.get(tab.groupId);
       this.placements.set(tabId, { windowId: tab.windowId, pinned: tab.pinned, originalGroup });
       await this.persist();
     }
-    if (this.groups.has(tab.groupId)) return;
+    if (this.groups.has(tab.groupId) && this.groups.get(tab.groupId) === ownerId) return;
     const candidates = await chrome.tabGroups.query({ windowId: tab.windowId });
-    const existing = candidates.find((group) => this.groups.has(group.id));
+    const existing = candidates.find((group) => this.groups.has(group.id) && this.groups.get(group.id) === ownerId);
     if (tab.pinned) await chrome.tabs.update(tabId, { pinned: false });
     const groupId = await chrome.tabs.group({ tabIds: [tabId], ...(existing ? { groupId: existing.id } : {}) });
-    this.groups.add(groupId);
-    await chrome.tabGroups.update(groupId, { title: 'Browser Relay', color: 'orange', collapsed: false });
+    this.groups.set(groupId, ownerId);
+    await chrome.tabGroups.update(groupId, { title: owner ? `Browser Relay · ${owner.name}` : 'Browser Relay', color: 'orange', collapsed: false });
     await this.persist();
   }
 
