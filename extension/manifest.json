@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Browser Relay",
-  "version": "0.2.0",
-  "description": "Lets local agents drive the tabs you attach, through a relay on 127.0.0.1. Nothing is sent anywhere else.",
+  "version": "0.3.0",
+  "description": "Lets agents drive the tabs you attach, through the relays you list: 127.0.0.1, or wss:// relays on your own machines.",
   "permissions": ["debugger", "storage", "alarms", "tabGroups"],
   "background": { "service_worker": "background.js" },
   "action": { "default_title": "Browser Relay: click to attach this tab" },

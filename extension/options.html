@@ -4,21 +4,40 @@
     <meta charset="utf-8" />
     <title>Browser Relay</title>
     <style>
-      body { font: 13px system-ui, sans-serif; margin: 16px; min-width: 360px; }
-      label { display: block; margin: 10px 0 4px; font-weight: 600; }
+      body { font: 13px system-ui, sans-serif; margin: 16px; min-width: 420px; }
+      fieldset { border: 1px solid #ccc; border-radius: 6px; margin: 0 0 12px; padding: 4px 12px 12px; }
+      legend { font-weight: 600; padding: 0 4px; }
+      label { display: block; margin: 8px 0 4px; font-weight: 600; }
       input { width: 100%; box-sizing: border-box; padding: 6px; font-family: ui-monospace, monospace; }
-      button { margin-top: 12px; padding: 6px 14px; }
+      button { margin-top: 10px; padding: 6px 14px; }
       p { color: #555; }
+      .status { font-weight: normal; color: #b3261e; }
+      .status.connected { color: #188038; }
+      .message { margin-left: 8px; }
+      .message.error { color: #b3261e; }
     </style>
   </head>
   <body>
-    <p>Run <code>browser-relay token</code> in a terminal and paste the result here.</p>
-    <label for="token">Relay token</label>
-    <input id="token" type="password" autocomplete="off" />
-    <label for="port">Relay port</label>
-    <input id="port" type="number" placeholder="19988" />
-    <button id="save">Save</button>
-    <span id="status"></span>
+    <p>
+      Each relay runs <code>browser-relay</code> on a computer you own and has its own token.
+      For this computer, run <code>browser-relay token --copy</code> and paste the token.
+      For another machine, run <code>browser-relay remote</code> there; it prints the
+      <code>wss://</code> address to use. Plain <code>ws://</code> only reaches this computer.
+    </p>
+    <div id="relays"></div>
+    <button id="add">Add a relay</button>
+    <template id="relay">
+      <fieldset>
+        <legend><span class="title"></span> <span class="status"></span></legend>
+        <label>Name <input name="name" autocomplete="off" placeholder="seraph-vm1" /></label>
+        <label>URL <input name="url" autocomplete="off" placeholder="wss://machine.tailnet.ts.net:19443" /></label>
+        <label>Token <input name="token" type="password" autocomplete="off" /></label>
+        <button class="save">Save</button>
+        <button class="remove">Remove</button>
+        <span class="message"></span>
+      </fieldset>
+    </template>
+    <script src="relays.js"></script>
     <script src="options.js"></script>
   </body>
 </html>

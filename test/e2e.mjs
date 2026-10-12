@@ -1,11 +1,13 @@
-// End-to-end check in a throwaway Chromium profile, with its own token and port:
+// End-to-end check in a throwaway Chromium profile, with its own tokens and ports:
 // extension -> relay -> MCP server -> Playwright, plus the relay's rejection rules.
+// A second relay is reached over wss:// through a stand-in for `tailscale serve`.
 // Needs a Chromium that still accepts --load-extension (branded Chrome does not):
 //   BROWSER_RELAY_TEST_CHROMIUM=/path/to/Chromium npm test
 // Defaults to the newest Playwright-cached Chromium.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +15,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import WebSocket from 'ws';
+import { checkRelays, fakeTailscaleServe } from './relays.mjs';
 import { checkSessions } from './sessions.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -23,8 +26,26 @@ const env = { ...process.env, BROWSER_RELAY_HOME: home, BROWSER_RELAY_PORT: Stri
 Object.assign(process.env, env);
 const token = (await import('../src/config.mjs')).loadToken();
 
+// Relay B stands for a relay on another machine: its own home, token and port,
+// reached by the extension at wss://relay-b.test through a fake `tailscale serve`.
+const PORT_B = 19990;
+const homeB = mkdtempSync(join(tmpdir(), 'browser-relay-test-b-'));
+const tokenB = randomBytes(32).toString('hex');
+writeFileSync(join(homeB, 'token'), `${tokenB}\n`, { mode: 0o600 });
+const serve = await fakeTailscaleServe(PORT_B, 'alice@example.com');
+const publicHostB = `relay-b.test:${serve.port}`;
+const envB = {
+  ...process.env, BROWSER_RELAY_HOME: homeB, BROWSER_RELAY_PORT: String(PORT_B),
+  BROWSER_RELAY_PUBLIC_HOSTS: publicHostB, BROWSER_RELAY_TAILSCALE_LOGINS: 'Alice@example.com',
+};
+
 function findChromium() {
   if (process.env.BROWSER_RELAY_TEST_CHROMIUM) return process.env.BROWSER_RELAY_TEST_CHROMIUM;
+  if (process.platform === 'linux') {
+    const cache = join(homedir(), '.cache', 'ms-playwright');
+    const dir = readdirSync(cache).filter((d) => /^chromium-\d+$/.test(d)).sort().at(-1);
+    return ['chrome-linux64', 'chrome-linux'].map((d) => join(cache, dir, d, 'chrome')).find(existsSync);
+  }
   const cache = join(homedir(), 'Library', 'Caches', 'ms-playwright');
   const dir = readdirSync(cache).filter((d) => /^chromium-\d+$/.test(d)).sort().at(-1);
   const base = ['chrome-mac-arm64', 'chrome-mac'].map((d) => join(cache, dir, d)).find(existsSync);
@@ -40,12 +61,15 @@ await new Promise((r) => site.listen(0, '127.0.0.1', r));
 const siteUrl = (path) => `http://127.0.0.1:${site.address().port}/${path}`;
 
 const relay = spawn(process.execPath, [join(ROOT, 'bin/browser-relay'), 'serve'], { env, stdio: ['ignore', 'inherit', 'inherit'] });
+const spawnRelayB = () => spawn(process.execPath, [join(ROOT, 'bin/browser-relay'), 'serve'], { env: envB, stdio: ['ignore', 'inherit', 'inherit'] });
+const relayB = { process: spawnRelayB() };
 const cleanup = [];
-cleanup.push(() => relay.kill(), () => site.close(), () => rmSync(home, { recursive: true, force: true }));
+cleanup.push(() => relay.kill(), () => relayB.process.kill(), () => site.close(), () => serve.close());
+cleanup.push(() => rmSync(home, { recursive: true, force: true }), () => rmSync(homeB, { recursive: true, force: true }));
 
-async function upgradeStatus(path, headers) {
+async function upgradeStatus(path, headers, port = PORT) {
   return new Promise((resolve) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}${path}`, { headers });
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${path}`, { headers });
     ws.on('open', () => (ws.close(), resolve(101)));
     ws.on('unexpected-response', (_req, res) => resolve(res.statusCode));
     ws.on('error', () => resolve('error'));
@@ -64,6 +88,9 @@ try {
   assert.equal(await upgradeStatus('/cdp', { authorization: `Bearer ${token}`, host: 'evil.example' }), 403, 'cdp rejects foreign Host (DNS rebinding)');
   console.log('ok  relay rejects bad token, web origins and foreign hosts');
 
+  await waitUntil(async () => (await relayRequest(PORT_B, '/health', { authorization: `Bearer ${tokenB}` })).status === 200, 'relay B up');
+  await checkPublicHostRules();
+
   // 2. Throwaway browser with the extension, configured through its service worker.
   const profile = mkdtempSync(join(tmpdir(), 'browser-relay-profile-'));
   cleanup.push(() => rmSync(profile, { recursive: true, force: true }));
@@ -71,13 +98,20 @@ try {
   const testBrowser = await chromium.launchPersistentContext(profile, {
     executablePath: findChromium(),
     headless: true,
-    args: [`--disable-extensions-except=${ext}`, `--load-extension=${ext}`],
+    args: [
+      `--disable-extensions-except=${ext}`, `--load-extension=${ext}`,
+      // relay-b.test is the fake tailnet name; its certificate is self-signed.
+      '--host-resolver-rules=MAP relay-b.test 127.0.0.1', '--ignore-certificate-errors',
+    ],
   });
   cleanup.unshift(() => testBrowser.close());
   let sw = testBrowser.serviceWorkers()[0] ?? (await testBrowser.waitForEvent('serviceworker'));
+  // Version 0.2 settings, as an upgraded extension would find them.
   await sw.evaluate(({ token, port }) => chrome.storage.local.set({ token, port }), { token, port: PORT });
   await waitUntil(async () => (await health()).extension, 'extension connected');
-  console.log('ok  extension connected');
+  const migrated = await sw.evaluate(() => chrome.storage.local.get(null));
+  assert.deepEqual(migrated, { relays: [{ id: 'local', name: 'This computer', url: `ws://127.0.0.1:${PORT}`, token }] });
+  console.log('ok  extension migrates 0.2 settings to a "This computer" relay and connects');
 
   // A restart can race with the startup alarm or a settings change. Only one
   // replacement socket should be opened, or the older socket can kill the new
@@ -92,8 +126,8 @@ try {
       }
     };
     try {
-      ws.close();
-      await Promise.all([connect(), connect()]);
+      conns.get('local').ws.close();
+      await Promise.all([connect('local'), connect('local')]);
       return attempts;
     } finally {
       globalThis.WebSocket = OriginalWebSocket;
@@ -146,7 +180,7 @@ try {
   assert.match(beforeClaim.content[0].text, /null, 0/);
   await sessionCall({ action: 'claim', sessionId: sessionA.id, tabId: userTabId });
   const claimedMarker = await marker(userTabId);
-  assert.equal(claimedMarker.title, 'Browser Relay · Checkout test');
+  assert.equal(claimedMarker.title, 'Browser Relay · This computer · Checkout test');
   const exec = async (code) => {
     const res = await call('tools/call', { name: 'execute', arguments: { sessionId: sessionA.id, code } });
     if (res.isError) throw new Error(res.content[0].text);
@@ -229,6 +263,11 @@ try {
   assert.match((await exec("const f = page.frames().find(f => f.url().includes('inner-frame')); return await f.locator('#x').textContent()"))[0].text, /inside \/inner-frame/);
   console.log('ok  extension reconnects after a relay restart');
 
+  await checkRelays({
+    ROOT, env, envB, PORT, PORT_B, token, tokenB, publicHostB, serve, relayB, spawnRelayB, cleanup, testBrowser,
+    sw, call, exec, sessionA, marker, health, waitUntil, siteUrl,
+  });
+
   await sw.evaluate((id) => toggle(id), userTabId);
   await waitUntil(async () => (await marker(userTabId)).title === 'Research', 'original group restored');
   assert.equal((await marker(userTabId)).color, 'blue');
@@ -266,9 +305,62 @@ try {
   for (const fn of cleanup) await Promise.resolve().then(fn).catch(() => {});
 }
 
-async function health() {
-  const res = await fetch(`http://127.0.0.1:${PORT}/health`, { headers: { authorization: `Bearer ${token}` } });
+async function health(port = PORT, auth = token) {
+  const res = await fetch(`http://127.0.0.1:${port}/health`, { headers: { authorization: `Bearer ${auth}` } });
   return res.json();
+}
+
+// fetch() cannot set Host, so simulated tailnet requests use node:http.
+function relayRequest(port, path, headers = {}, method = 'GET') {
+  return new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode }));
+    });
+    req.on('error', () => resolve({ status: 'error' }));
+    req.end(method === 'POST' ? '{"action":"list"}' : undefined);
+  });
+}
+
+// What a request through `tailscale serve` looks like to relay B, and what it may reach.
+async function checkPublicHostRules() {
+  const auth = { authorization: `Bearer ${tokenB}` };
+  const tailnet = (login, extra = {}) => ({ host: publicHostB, 'tailscale-user-login': login, ...extra });
+  const status = async (path, headers, method) => (await relayRequest(PORT_B, path, headers, method)).status;
+  assert.equal(await status('/health', { ...auth, host: publicHostB }), 403, 'public host needs a Tailscale login');
+  assert.equal(await status('/health', { ...auth, ...tailnet('mallory@example.com') }), 403, 'login must be allowed');
+  assert.equal(await status('/health', { ...auth, ...tailnet('alice@example.com', { 'tailscale-funnel-request': '?1' }) }), 403, 'Funnel requests are refused');
+  assert.equal(await status('/health', { ...auth, host: 'relay-b.test:1' }), 403, 'other ports are foreign hosts');
+  assert.equal(await status('/health', tailnet('alice@example.com')), 401, 'tailnet requests still need the token');
+  assert.equal(await status('/health', { authorization: `Bearer ${token}`, ...tailnet('alice@example.com') }), 401, 'each relay has its own token');
+  assert.equal(await status('/health', { ...auth, ...tailnet('ALICE@example.com') }), 200, 'allowed login reaches health');
+  assert.equal(await status('/sessions', { ...auth, ...tailnet('alice@example.com'), 'content-type': 'application/json' }, 'POST'), 403, 'sessions are loopback-only');
+  assert.equal(await status('/shutdown', { ...auth, ...tailnet('alice@example.com') }, 'POST'), 403, 'shutdown is loopback-only');
+  assert.equal(await status('/health', { ...auth, 'tailscale-user-login': 'mallory@example.com' }), 200, 'loopback ignores Tailscale headers');
+
+  const session = JSON.parse(await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: PORT_B, path: '/sessions', method: 'POST', headers: auth }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c)).on('end', () => resolve(body));
+    });
+    req.end('{"action":"create","name":"probe"}');
+  }));
+  const extensionOrigin = { origin: 'chrome-extension://abc' };
+  assert.equal(await upgradeStatus('/cdp', { ...auth, ...tailnet('alice@example.com'), 'x-browser-relay-session': session.id }, PORT_B), 403, 'cdp is loopback-only');
+  assert.equal(await upgradeStatus(`/extension?token=${tokenB}`, { ...extensionOrigin, host: publicHostB }, PORT_B), 403, 'extension over the tailnet needs a login');
+  assert.equal(await upgradeStatus(`/extension?token=${tokenB}`, { ...extensionOrigin, ...tailnet('mallory@example.com') }, PORT_B), 403);
+  assert.equal(await upgradeStatus(`/extension?token=${token}`, { ...extensionOrigin, ...tailnet('alice@example.com') }, PORT_B), 401);
+  assert.equal(await upgradeStatus(`/extension?token=${tokenB}`, { origin: 'https://evil.example', ...tailnet('alice@example.com') }, PORT_B), 403);
+
+  // A relay keeps tabs owned by sessions it does not know out of its list.
+  const ext = new WebSocket(`ws://127.0.0.1:${PORT_B}/extension?token=${tokenB}`, { headers: { ...extensionOrigin, ...tailnet('alice@example.com') } });
+  await new Promise((resolve, reject) => { ext.once('open', resolve); ext.once('error', reject); });
+  ext.send(JSON.stringify({ event: 'tabAttached', tabId: 1, targetInfo: { targetId: 'one', url: 'about:blank' }, owner: { id: 'not-mine', name: 'x' } }));
+  ext.send(JSON.stringify({ event: 'tabAttached', tabId: 2, targetInfo: { targetId: 'two', url: 'about:blank' }, owner: null }));
+  await waitUntil(async () => (await health(PORT_B, tokenB)).tabs === 1, 'only the unowned tab is listed');
+  ext.close();
+  await waitUntil(async () => !(await health(PORT_B, tokenB)).extension, 'probe extension gone');
+  console.log('ok  public hosts need an allowed Tailscale login and the token, and only reach /extension and /health');
 }
 
 async function waitUntil(check, label, ms = 15_000) {

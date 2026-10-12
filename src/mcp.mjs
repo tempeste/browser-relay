@@ -9,7 +9,7 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { HOST, LOG_FILE, PORT, loadToken, relayUrl } from './config.mjs';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const OUTPUT_LIMIT = 20_000;
 const EXTENSION_WAIT_MS = 35_000; // one extension reconnect alarm period, plus slack
 const CLI = fileURLToPath(new URL('../bin/browser-relay', import.meta.url));
@@ -106,7 +106,7 @@ async function ensureRelay() {
   if (!connected) {
     throw new Error(
       'The relay is running but the Browser Relay extension is not connected. Make sure Chrome is open, ' +
-        'the extension is loaded, and its options page has the token from `browser-relay token`.',
+        'the extension is loaded, and its options list this relay with the token from `browser-relay token`.',
     );
   }
 }

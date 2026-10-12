@@ -1,27 +1,29 @@
 // Browser Relay service worker.
 //
-// Clicking the toolbar button attaches chrome.debugger to that tab and exposes it
-// to the local relay (ws://127.0.0.1). The relay can also ask for new tabs, which
-// are attached automatically. The only network endpoint this file ever talks to is
-// the relay on 127.0.0.1. Controlled tabs have an orange Browser Relay tab group;
-// Chrome's browser-wide debugging bar also offers Cancel to detach all tabs.
+// Clicking the toolbar button attaches chrome.debugger to that tab and offers it to
+// the relays listed in the options: the relay on this computer (ws://127.0.0.1) and
+// any relays on other machines you own (wss://). Each relay has its own token and
+// WebSocket. A tab belongs to at most one relay session: the first to claim it, or
+// the one that opened it. Only that relay sees its CDP events or can command it.
+// Those relays are the only network endpoints this file ever talks to.
+// Controlled tabs have an orange Browser Relay tab group; Chrome's browser-wide
+// debugging bar also offers Cancel to detach all tabs.
 
-importScripts('tab-markers.js');
+importScripts('relays.js', 'tab-markers.js');
 
-const DEFAULT_PORT = 19988;
 const PING_MS = 20_000;
 const RETRY_MS = 2_000;
+const MAX_RETRY_MS = 30_000;
 
-let ws = null;
-let connecting = false;
-let settingsVersion = 0;
+const conns = new Map(); // relay ID -> { relay, ws, retryMs, retryTimer, status }
 const attached = new Map(); // tabId -> targetInfo
-const owners = new Map(); // tabId -> named relay session
+const owners = new Map(); // tabId -> { relay, id, name }: a named session on one relay
 const children = new Map(); // child CDP sessionId -> last attachment event
 const tabQueues = new Map();
 const forgetTasks = new Map();
-const tabMarkers = new RelayTabMarkers();
-const ready = restoreAttached();
+const tabMarkers = new RelayTabMarkers((relayId) => conns.get(relayId)?.relay.name ?? 'removed relay');
+let relaysQueue = Promise.resolve();
+const ready = syncRelays().then(restoreAttached);
 
 // Listeners must be registered synchronously so events wake the worker.
 chrome.action.onClicked.addListener((tab) => toggle(tab.id));
@@ -29,11 +31,10 @@ chrome.alarms.onAlarm.addListener(() => connect());
 chrome.runtime.onStartup.addListener(() => connect());
 // Wakes the worker every 30s so it reconnects after a relay restart.
 chrome.alarms.create('reconnect', { periodInMinutes: 0.5 });
-chrome.storage.onChanged.addListener((changes) => {
-  if (!changes.token && !changes.port) return;
-  settingsVersion++;
-  ws?.close();
-  connect();
+chrome.storage.onChanged.addListener((changes, area) => {
+  const legacy = changes.token?.newValue !== undefined || changes.port?.newValue !== undefined;
+  if (area !== 'local' || (!changes.relays && !legacy)) return;
+  syncRelays().then(() => connect()).catch(console.error);
 });
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!attached.has(source.tabId)) return;
@@ -45,7 +46,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     children.delete(params.sessionId);
     persist().catch(console.error);
   }
-  send(event);
+  const owner = owners.get(source.tabId);
+  if (owner) sendTo(owner.relay, event);
 });
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId !== undefined) forget(source.tabId, reason).catch(console.error);
@@ -57,64 +59,111 @@ chrome.tabGroups.onRemoved.addListener((group) => tabMarkers.groupRemoved(group.
 
 connect();
 
-async function settings() {
-  const { token, port } = await chrome.storage.local.get(['token', 'port']);
-  return { token, port: Number(port) || DEFAULT_PORT };
-}
-
-async function connect() {
-  if (connecting || (ws && ws.readyState <= WebSocket.OPEN)) return;
-  connecting = true;
-  const version = settingsVersion;
-  try {
-    await ready;
-    const { token, port } = await settings();
-    if (version !== settingsVersion) {
-      connecting = false;
-      return connect();
-    }
-    if (!token) {
-      connecting = false;
-      return updateTitle('Browser Relay: set the token in the extension options');
-    }
-    const sock = new WebSocket(`ws://127.0.0.1:${port}/extension?token=${encodeURIComponent(token)}`);
-    ws = sock;
-    let pingTimer = null;
-    sock.onopen = () => {
-      connecting = false;
-      updateTitle('Browser Relay: connected. Click to attach or detach this tab');
-      for (const [tabId, targetInfo] of attached) {
-        updateAttachedTitle(tabId);
-        send({ event: 'tabAttached', tabId, targetInfo, owner: owners.get(tabId) ?? null });
+// Apply the stored relay list: open new relays, reconnect changed ones and drop
+// removed ones. Tabs owned through a removed relay are released.
+function syncRelays() {
+  const next = relaysQueue.then(async () => {
+    const relays = await loadRelays();
+    for (const relay of relays) {
+      const conn = conns.get(relay.id);
+      if (!conn) {
+        conns.set(relay.id, { relay, ws: null, retryMs: 0, retryTimer: null, status: 'offline' });
+        continue;
       }
-      for (const event of children.values()) send(event);
-      // Traffic on this socket keeps the service worker alive (Chrome 116+).
-      pingTimer = setInterval(() => {
-        if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ event: 'ping' }));
-      }, PING_MS);
-    };
-    sock.onmessage = (e) => handle(JSON.parse(e.data));
-    sock.onerror = () => {};
-    sock.onclose = () => {
-      clearInterval(pingTimer);
-      if (ws !== sock) return;
-      ws = null;
-      connecting = false;
-      updateTitle('Browser Relay: relay not running');
-      for (const tabId of attached.keys()) updateAttachedTitle(tabId);
-      setTimeout(connect, RETRY_MS);
-    };
-  } catch (err) {
-    // A failed storage read or socket construction must not block later alarms.
-    connecting = false;
-    ws = null;
-    updateTitle(`Browser Relay: connection failed (${err.message})`);
-    setTimeout(connect, RETRY_MS);
-  }
+      const moved = conn.relay.url !== relay.url || conn.relay.token !== relay.token;
+      const renamed = conn.relay.name !== relay.name;
+      conn.relay = relay;
+      if (moved) disconnect(conn);
+      if (renamed) {
+        for (const [tabId, owner] of owners) if (owner.relay === relay.id) tabMarkers.mark(tabId, owner).catch(console.error);
+      }
+    }
+    for (const [id, conn] of conns) {
+      if (relays.some((relay) => relay.id === id)) continue;
+      conns.delete(id);
+      disconnect(conn);
+      for (const [tabId, owner] of owners) if (owner.relay === id) release(tabId, 'relay removed').catch(console.error);
+    }
+    publishStatus();
+  });
+  relaysQueue = next.catch(console.error);
+  return next;
 }
 
-function send(msg) {
+function disconnect(conn) {
+  clearTimeout(conn.retryTimer);
+  conn.retryMs = 0;
+  const old = conn.ws;
+  conn.ws = null;
+  old?.close();
+  conn.status = 'offline';
+}
+
+// Without an ID, connects every relay. Each relay keeps its own socket and backoff.
+async function connect(relayId) {
+  await ready;
+  if (relayId === undefined) return Promise.all([...conns.keys()].map(connect));
+  const conn = conns.get(relayId);
+  if (!conn || (conn.ws && conn.ws.readyState <= WebSocket.OPEN)) return;
+  clearTimeout(conn.retryTimer);
+  if (!conn.relay.token) return setStatus(conn, 'needs a token');
+  let sock;
+  try {
+    sock = new WebSocket(`${conn.relay.url}/extension?token=${encodeURIComponent(conn.relay.token)}`);
+  } catch (err) {
+    // A bad stored URL must not block the other relays or later alarms.
+    setStatus(conn, `failed (${err.message})`);
+    return retry(conn);
+  }
+  conn.ws = sock;
+  setStatus(conn, 'connecting');
+  let pingTimer = null;
+  sock.onopen = () => {
+    if (conn.ws !== sock) return;
+    conn.retryMs = 0;
+    setStatus(conn, 'connected');
+    for (const [tabId, targetInfo] of attached) {
+      updateAttachedTitle(tabId);
+      if (visibleTo(relayId, tabId)) sendTo(relayId, { event: 'tabAttached', tabId, targetInfo, owner: sessionOf(owners.get(tabId)) });
+    }
+    for (const event of children.values()) if (owners.get(event.tabId)?.relay === relayId) sendTo(relayId, event);
+    // Traffic on this socket keeps the service worker alive (Chrome 116+).
+    pingTimer = setInterval(() => {
+      if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ event: 'ping' }));
+    }, PING_MS);
+  };
+  sock.onmessage = (e) => handle(relayId, sock, JSON.parse(e.data));
+  sock.onerror = () => {};
+  sock.onclose = () => {
+    clearInterval(pingTimer);
+    if (conn.ws !== sock) return;
+    conn.ws = null;
+    setStatus(conn, 'offline');
+    for (const tabId of attached.keys()) updateAttachedTitle(tabId);
+    retry(conn);
+  };
+}
+
+function retry(conn) {
+  if (conns.get(conn.relay.id) !== conn) return;
+  conn.retryMs = Math.min(conn.retryMs ? conn.retryMs * 2 : RETRY_MS, MAX_RETRY_MS);
+  clearTimeout(conn.retryTimer);
+  conn.retryTimer = setTimeout(() => connect(conn.relay.id), conn.retryMs);
+}
+
+const isOpen = (relayId) => conns.get(relayId)?.ws?.readyState === WebSocket.OPEN;
+// Unclaimed tabs are offered to every relay; claimed tabs only to their own.
+const visibleTo = (relayId, tabId) => !owners.has(tabId) || owners.get(tabId).relay === relayId;
+// Relays know their own sessions by { id, name }; the relay ID stays in the extension.
+const sessionOf = (owner) => owner ? { id: owner.id, name: owner.name } : null;
+
+function sendTo(relayId, msg) {
+  const ws = conns.get(relayId)?.ws;
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function announce(msg, owner) {
+  for (const relayId of conns.keys()) if (!owner || owner.relay === relayId) sendTo(relayId, msg);
 }
 
 // Serialize attachment and ownership changes. CDP requests stay concurrent so
@@ -127,27 +176,30 @@ function runTab(tabId, task) {
   return next;
 }
 
-async function handle({ id, method, params }) {
+// Answers go back on the socket the request came from, so a reconnect cannot
+// deliver one relay's answer to another connection.
+async function handle(relayId, sock, { id, method, params }) {
+  const reply = (msg) => sock.readyState === WebSocket.OPEN && sock.send(JSON.stringify(msg));
   try {
     await ready;
     let result;
-    if (method === 'listTabs') result = await listTabs();
-    else if (method === 'createTab') result = await createOwnedTab(params);
-    else if (method === 'cdp') result = await tabCommand(method, params);
-    else result = await runTab(params.tabId, () => tabCommand(method, params));
-    send({ id, result: result ?? {} });
+    if (method === 'listTabs') result = await listTabs(relayId);
+    else if (method === 'createTab') result = await createOwnedTab(relayId, params);
+    else if (method === 'cdp') result = await tabCommand(relayId, method, params);
+    else result = await runTab(params.tabId, () => tabCommand(relayId, method, params));
+    reply({ id, result: result ?? {} });
   } catch (err) {
-    send({ id, error: String(err?.message ?? err) });
+    reply({ id, error: String(err?.message ?? err) });
   }
 }
 
-async function listTabs() {
+async function listTabs(relayId) {
   const tabs = [];
   for (const tabId of attached.keys()) {
     try {
       const { targetInfo } = await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo');
       attached.set(tabId, targetInfo);
-      tabs.push({ tabId, targetInfo, owner: owners.get(tabId) ?? null });
+      if (visibleTo(relayId, tabId)) tabs.push({ tabId, targetInfo, owner: sessionOf(owners.get(tabId)) });
     } catch {
       await forget(tabId, 'no longer attached');
     }
@@ -155,30 +207,36 @@ async function listTabs() {
   return tabs;
 }
 
-async function createOwnedTab({ url, owner }) {
+async function createOwnedTab(relayId, { url, owner }) {
   if (!owner?.id || !owner.name) throw new Error('A named session is required');
   const tab = await chrome.tabs.create({ url, active: false });
   try {
-    return { tabId: tab.id, targetInfo: await attach(tab.id, { announce: false, owner }) };
+    return { tabId: tab.id, targetInfo: await attach(tab.id, { announce: false, owner: { relay: relayId, id: owner.id, name: owner.name } }) };
   } catch (err) {
     await chrome.tabs.remove(tab.id).catch(() => {});
     throw err;
   }
 }
 
-async function tabCommand(method, params) {
+async function tabCommand(relayId, method, params) {
   const { tabId, owner } = params;
   if (!attached.has(tabId)) throw new Error(`tab ${tabId} is not attached`);
   if (method === 'claimTab') {
+    if (!owner?.id || !owner.name) throw new Error('A named session is required');
+    // Claims are serialized per tab, so the first relay to claim wins.
     if (owners.has(tabId)) throw new Error('Tab is already owned');
-    await tabMarkers.mark(tabId, owner);
+    const claimed = { relay: relayId, id: owner.id, name: owner.name };
+    await tabMarkers.mark(tabId, claimed);
     if (!attached.has(tabId)) throw new Error('Tab detached during claim');
-    owners.set(tabId, owner);
+    owners.set(tabId, claimed);
     await persist();
     updateAttachedTitle(tabId);
+    // The other relays listed this tab as available. It is no longer theirs to see.
+    for (const id of conns.keys()) if (id !== relayId) sendTo(id, { event: 'tabDetached', tabId, reason: 'claimed through another relay' });
     return {};
   }
-  if (!owner?.id || owners.get(tabId)?.id !== owner.id) throw new Error('Tab is not owned by this session');
+  const current = owners.get(tabId);
+  if (!owner?.id || current?.relay !== relayId || current.id !== owner.id) throw new Error('Tab is not owned by this session');
   if (method === 'cdp') {
     const result = await chrome.debugger.sendCommand({ tabId, sessionId: params.sessionId }, params.method, params.params);
     if (params.method === 'Page.getFrameTree' && !params.sessionId) {
@@ -231,8 +289,7 @@ async function toggle(tabId) {
   await ready;
   return runTab(tabId, async () => {
     await forgetTasks.get(tabId);
-    const { token } = await settings();
-    if (!token) return chrome.runtime.openOptionsPage();
+    if (![...conns.values()].some((conn) => conn.relay.token)) return chrome.runtime.openOptionsPage();
     try {
       if (attached.has(tabId)) {
         await chrome.debugger.detach({ tabId });
@@ -247,7 +304,15 @@ async function toggle(tabId) {
   });
 }
 
-async function attach(tabId, { announce = true, owner = null } = {}) {
+function release(tabId, reason) {
+  return runTab(tabId, async () => {
+    if (!attached.has(tabId)) return;
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+    await forget(tabId, reason);
+  });
+}
+
+async function attach(tabId, { announce: announceTab = true, owner = null } = {}) {
   await chrome.debugger.attach({ tabId }, '1.3');
   let targetInfo;
   try {
@@ -264,16 +329,17 @@ async function attach(tabId, { announce = true, owner = null } = {}) {
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#d93025' });
   await chrome.action.setBadgeText({ tabId, text: 'ON' });
   updateAttachedTitle(tabId);
-  if (announce) send({ event: 'tabAttached', tabId, targetInfo, owner: owners.get(tabId) ?? null });
+  if (announceTab) announce({ event: 'tabAttached', tabId, targetInfo, owner: sessionOf(owner) }, owner);
   return targetInfo;
 }
 
 function forget(tabId, reason) {
   if (forgetTasks.has(tabId)) return forgetTasks.get(tabId);
   if (!attached.delete(tabId)) return Promise.resolve();
+  const owner = owners.get(tabId);
   owners.delete(tabId);
   for (const [id, event] of children) if (event.tabId === tabId) children.delete(id);
-  send({ event: 'tabDetached', tabId, reason });
+  announce({ event: 'tabDetached', tabId, reason }, owner);
   const task = (async () => {
     await persist();
     await tabMarkers.unmark(tabId);
@@ -291,10 +357,16 @@ async function restoreAttached() {
   const { tabs = {}, tabOwners = {}, tabChildren = [] } = await chrome.storage.session.get(['tabs', 'tabOwners', 'tabChildren']);
   for (const [key, targetInfo] of Object.entries(tabs)) {
     const tabId = Number(key);
+    const owner = tabOwners[key];
     try {
       await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo');
+      if (owner && !conns.has(owner.relay)) {
+        // Its relay was removed while the worker was stopped.
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+        continue;
+      }
       attached.set(tabId, targetInfo);
-      if (tabOwners[key]) owners.set(tabId, tabOwners[key]);
+      if (owner) owners.set(tabId, owner);
     } catch {
       // No longer attached (tab closed, browser restarted, or the user pressed Cancel).
     }
@@ -323,13 +395,31 @@ function persist() {
   });
 }
 
+function setStatus(conn, status) {
+  conn.status = status;
+  publishStatus();
+}
+
+// The options page shows each relay's status from session storage.
+function publishStatus() {
+  const relayStatus = Object.fromEntries([...conns].map(([id, conn]) => [id, conn.status]));
+  chrome.storage.session.set({ relayStatus }).catch(() => {});
+  const open = [...conns.keys()].filter(isOpen).length;
+  if (![...conns.values()].some((conn) => conn.relay.token)) {
+    updateTitle('Browser Relay: add a relay token in the extension options');
+  } else {
+    updateTitle(`Browser Relay: connected to ${open} of ${conns.size} relay${conns.size === 1 ? '' : 's'}. Click to attach or detach this tab`);
+  }
+}
+
 function updateTitle(title, tabId) {
   chrome.action.setTitle(tabId === undefined ? { title } : { title, tabId }).catch(() => {});
 }
 
 function updateAttachedTitle(tabId) {
   const owner = owners.get(tabId);
-  const status = owner ? `owned by ${owner.name}` : 'available to claim';
-  const offline = ws?.readyState === WebSocket.OPEN ? '' : '; relay offline';
+  const status = owner ? `owned by ${owner.name} on ${conns.get(owner.relay)?.relay.name ?? 'a removed relay'}` : 'available to claim';
+  const online = owner ? isOpen(owner.relay) : [...conns.keys()].some(isOpen);
+  const offline = online ? '' : owner ? '; its relay is offline' : '; no relay connected';
   updateTitle(`Browser Relay: this tab is ${status}${offline}. Click to detach it`, tabId);
 }

@@ -5,15 +5,22 @@
 // To Playwright it looks like a normal Chrome whose only pages are owned by the
 // named session selected in the connection header. Each attached tab is exposed
 // as a flat CDP session named `tab-<tabId>`.
+//
+// The relay only listens on 127.0.0.1. Chrome on another machine can reach its
+// /extension endpoint through `tailscale serve`, which proxies to 127.0.0.1 and
+// names the caller's Tailscale login. Everything else stays loopback-only.
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
-import { HOST, PORT, loadToken, tokensMatch } from './config.mjs';
+import { HOST, PORT, loadSettings, loadToken, tokensMatch } from './config.mjs';
 import { Sessions } from './sessions.mjs';
 
 const EXTENSION_TIMEOUT_MS = 30_000;
 
-export function startRelay({ port = PORT, token = loadToken(), log = defaultLog } = {}) {
-  const allowedHosts = new Set([`${HOST}:${port}`, `localhost:${port}`]);
+export function startRelay({ port = PORT, token = loadToken(), log = defaultLog, settings = loadSettings() } = {}) {
+  const localHosts = new Set([`${HOST}:${port}`, `localhost:${port}`]);
+  const publicHosts = new Set(settings.publicHosts);
+  const tailscaleLogins = new Set(settings.allowedTailscaleLogins);
+  const extensionIds = new Set(settings.allowedExtensionIds);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 * 1024 });
 
   const sessions = new Sessions();
@@ -52,7 +59,12 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
     params: { sessionId: tab.sessionId, targetInfo: { ...tab.targetInfo, attached: true }, waitingForDebugger: false },
   });
 
+  // The extension only shows a relay its own sessions' tabs and unclaimed tabs.
+  // Ignore anything else rather than trusting it.
+  const foreign = (owner) => owner && !sessions.items.has(owner.id);
+
   function addTab(tabId, targetInfo, owner = null) {
+    if (foreign(owner)) return null;
     const existing = tabs.get(tabId);
     if (existing && existing.targetInfo.targetId === targetInfo.targetId && existing.owner?.id === owner?.id) {
       existing.targetInfo = targetInfo;
@@ -100,7 +112,7 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
       if (extension) {
         for (const tab of await callExtension('listTabs')) {
           const known = addTab(tab.tabId, tab.targetInfo, tab.owner);
-          known.targetInfo = tab.targetInfo;
+          if (known) known.targetInfo = tab.targetInfo;
         }
       }
       const owner = sessionId ? sessions.get(sessionId) : null;
@@ -115,12 +127,12 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
     const snapshot = await callExtension('listTabs');
     for (const tab of snapshot) {
       const known = addTab(tab.tabId, tab.targetInfo, tab.owner);
-      known.targetInfo = tab.targetInfo;
+      if (known) known.targetInfo = tab.targetInfo;
     }
-    for (const id of tabs.keys()) if (!snapshot.some((t) => t.tabId === id)) removeTab(id, 'no longer attached');
+    for (const id of tabs.keys()) if (!snapshot.some((t) => t.tabId === id && !foreign(t.owner))) removeTab(id, 'no longer attached');
     if (action === 'claim') {
       const tab = tabs.get(tabId);
-      if (!tab) throw new Error('Tab is not attached; click its toolbar button first');
+      if (!tab) throw new Error('Tab is not attached or belongs to another relay; click its toolbar button first');
       if (tab.owner?.id === owner.id) return { tabId, owner };
       if (tab.owner) throw new Error('Tab is already owned by another session');
       await callExtension('claimTab', { tabId, owner });
@@ -238,13 +250,13 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
     });
   }
 
-  function onExtension(ws) {
+  function onExtension(ws, via) {
     if (extension) {
       extension.close(4000, 'replaced by a newer extension connection');
       clearExtension('extension connection replaced');
     }
     extension = ws;
-    log('extension connected');
+    log(`extension connected (${via === 'tailnet' ? 'over the tailnet' : 'on this machine'})`);
     ws.on('message', (data) => {
       if (extension !== ws) return;
       let msg;
@@ -300,13 +312,34 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
 
   const bearer = (req) => req.headers.authorization?.replace(/^Bearer /, '');
 
+  // 'local' for 127.0.0.1/localhost, 'tailnet' for an allowed Tailscale login via a
+  // public host, otherwise null. The Host check blocks DNS rebinding. `tailscale serve`
+  // sets Tailscale-User-Login itself and drops any copy the client sent; it sends none
+  // for tagged devices or Funnel, so those are refused too.
+  function caller(req) {
+    const host = req.headers.host?.toLowerCase();
+    if (localHosts.has(host)) return 'local';
+    if (!publicHosts.has(host) || req.headers['tailscale-funnel-request']) return null;
+    return tailscaleLogins.has(req.headers['tailscale-user-login']?.toLowerCase()) ? 'tailnet' : null;
+  }
+
   const server = http.createServer(async (req, res) => {
-    // Host check blocks DNS-rebinding; the token check blocks everything else.
-    if (req.headers.origin || !allowedHosts.has(req.headers.host) || !tokensMatch(token, bearer(req))) {
+    const via = caller(req);
+    if (!via) {
+      res.writeHead(403).end();
+      return;
+    }
+    // The token check blocks everything else.
+    if (req.headers.origin || !tokensMatch(token, bearer(req))) {
       res.writeHead(401).end();
       return;
     }
     const { pathname } = new URL(req.url, 'http://relay');
+    // Over the tailnet the relay only serves its extension socket and this check.
+    if (via === 'tailnet' && !(req.method === 'GET' && pathname === '/health')) {
+      res.writeHead(403).end();
+      return;
+    }
     if (req.method === 'GET' && pathname === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, extension: Boolean(extension), tabs: tabs.size, clients: clients.size }));
@@ -337,17 +370,20 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
       socket.end(`HTTP/1.1 ${code} Rejected\r\n\r\n`);
       log(`rejected ${req.url.split('?')[0]} from origin ${req.headers.origin ?? '(none)'}: ${code}`);
     };
-    if (!allowedHosts.has(req.headers.host)) return reject(403);
+    const via = caller(req);
+    if (!via) return reject(403);
     const url = new URL(req.url, 'http://relay');
     const origin = req.headers.origin;
     if (url.pathname === '/extension') {
       // Browsers can't set headers on WebSockets, so the extension sends the token in the query.
       if (!origin?.startsWith('chrome-extension://')) return reject(403);
+      if (extensionIds.size && !extensionIds.has(origin.slice('chrome-extension://'.length))) return reject(403);
       if (!tokensMatch(token, url.searchParams.get('token'))) return reject(401);
-      wss.handleUpgrade(req, socket, head, onExtension);
+      wss.handleUpgrade(req, socket, head, (ws) => onExtension(ws, via));
     } else if (url.pathname === '/cdp') {
-      // Web pages always send an Origin header; local CDP clients don't.
-      if (origin) return reject(403);
+      // Web pages always send an Origin header; local CDP clients don't. CDP clients
+      // run on this machine, so /cdp is never served over the tailnet.
+      if (origin || via !== 'local') return reject(403);
       if (!tokensMatch(token, bearer(req))) return reject(401);
       let owner;
       try { owner = sessions.get(req.headers['x-browser-relay-session']); } catch { return reject(403); }
@@ -361,6 +397,9 @@ export function startRelay({ port = PORT, token = loadToken(), log = defaultLog 
     server.once('error', reject);
     server.listen(port, HOST, () => {
       log(`relay listening on ${HOST}:${port}`);
+      if (publicHosts.size) {
+        log(`also accepting ${[...publicHosts].join(', ')} from Tailscale logins ${[...tailscaleLogins].join(', ') || '(none configured, so nobody)'}`);
+      }
       resolve(server);
     });
   });

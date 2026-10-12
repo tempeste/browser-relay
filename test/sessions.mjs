@@ -30,7 +30,7 @@ export async function checkSessions({ ROOT, env, PORT, token, call, cleanup, sw,
   assert.equal(cTabs.length, 1);
   const bId = bTabs[0].tabId;
   const cId = cTabs[0].tabId;
-  assert.equal((await marker(bId)).title, 'Browser Relay · Docs research');
+  assert.equal((await marker(bId)).title, 'Browser Relay · This computer · Docs research');
   assert.notEqual((await marker(bId)).groupId, (await marker(cId)).groupId, 'duplicate labels still have distinct ownership');
   assert.notEqual((await marker(bId)).groupId, (await marker(userTabId)).groupId);
   console.log('ok  two MCP processes and multiple sessions in one process have separate tabs, state and groups');
@@ -70,10 +70,10 @@ export async function checkSessions({ ROOT, env, PORT, token, call, cleanup, sw,
   assert.match((await exec("const f = page.frames().find(f => f.url().includes('inner-frame')); return await f.locator('#x').textContent()"))[0].text, /inside \/inner-frame/);
   assert.match((await executeB('return context.pages().length')).content[0].text, /Return value: 1/);
   assert.match((await executeC('return context.pages().length')).content[0].text, /Return value: 1/);
-  assert.equal((await marker(bId)).title, 'Browser Relay · Docs research');
+  assert.equal((await marker(bId)).title, 'Browser Relay · This computer · Docs research');
   assert.notEqual((await marker(bId)).groupId, (await marker(cId)).groupId);
   const tooltip = await sw.evaluate((tabId) => chrome.action.getTitle({ tabId }), bId);
-  assert.match(tooltip, /owned by Docs research/);
+  assert.match(tooltip, /owned by Docs research on This computer/);
   console.log('ok  stopping and restarting the extension worker preserves session ownership and groups');
 
   // Two claims issued together get exactly one winner.
@@ -127,7 +127,7 @@ export async function checkSessions({ ROOT, env, PORT, token, call, cleanup, sw,
   console.log('ok  claim races, request ordering, reset, process crash, resume and close preserve ownership');
 }
 
-async function cdp(port, token, sessionId) {
+export async function cdp(port, token, sessionId) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/cdp`, { headers: { authorization: `Bearer ${token}`, 'x-browser-relay-session': sessionId } });
   const pending = new Map();
   const events = [];
@@ -145,7 +145,7 @@ async function cdp(port, token, sessionId) {
   }) };
 }
 
-function rpcClient(child) {
+export function rpcClient(child) {
   const pending = new Map();
   let seq = 0;
   createInterface({ input: child.stdout }).on('line', (line) => {

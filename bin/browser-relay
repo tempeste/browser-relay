@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { LOG_FILE, TOKEN_FILE, loadToken, relayUrl } from '../src/config.mjs';
+import { CONFIG_FILE, LOG_FILE, TOKEN_FILE, loadToken, relayUrl } from '../src/config.mjs';
 
 const USAGE = `browser-relay <command>
 
@@ -9,54 +9,89 @@ const USAGE = `browser-relay <command>
   token        print the token to paste into the extension options (--copy to use the clipboard)
   status       show whether the relay and extension are connected
   stop         stop a running relay
+  remote       let Chrome on another machine connect over the tailnet:
+                 remote [status] | enable --login <login> [--https-port 19443] [--extension-id <id>] [--apply] | disable [--apply]
+  service      keep the relay running with a systemd --user unit (Linux): service [print | install | uninstall]
 
-Token: ${TOKEN_FILE}
-Log:   ${LOG_FILE}`;
+Token:  ${TOKEN_FILE}
+Config: ${CONFIG_FILE}
+Log:    ${LOG_FILE}`;
 
 const [command, ...args] = process.argv.slice(2);
 const auth = () => ({ authorization: `Bearer ${loadToken()}` });
 
-switch (command) {
-  case 'serve': {
-    const { startRelay } = await import('../src/relay.mjs');
-    await startRelay();
-    break;
-  }
-  case 'mcp': {
-    const { startMcpServer } = await import('../src/mcp.mjs');
-    startMcpServer();
-    break;
-  }
-  case 'token': {
-    const token = loadToken();
-    if (args.includes('--copy')) {
-      execFileSync('pbcopy', { input: token });
-      console.log('Token copied to the clipboard.');
-    } else {
-      console.log(token);
-    }
-    break;
-  }
-  case 'status': {
+// The first clipboard tool that exists. Never fall back to printing the token.
+function copy(text) {
+  const tools = process.platform === 'darwin' ? [['pbcopy']] : [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']];
+  for (const [tool, ...toolArgs] of tools) {
     try {
-      const res = await fetch(relayUrl('/health'), { headers: auth(), signal: AbortSignal.timeout(1000) });
-      console.log(res.ok ? JSON.stringify(await res.json()) : `relay answered ${res.status}`);
-    } catch {
-      console.log('relay not running');
-      process.exitCode = 1;
+      execFileSync(tool, toolArgs, { input: text, stdio: ['pipe', 'ignore', 'ignore'] });
+      return true;
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
     }
-    break;
   }
-  case 'stop': {
-    try {
-      await fetch(relayUrl('/shutdown'), { method: 'POST', headers: auth(), signal: AbortSignal.timeout(1000) });
-      console.log('relay stopped');
-    } catch {
-      console.log('relay not running');
+  return false;
+}
+
+try {
+  switch (command) {
+    case 'serve': {
+      const { startRelay } = await import('../src/relay.mjs');
+      await startRelay();
+      break;
     }
-    break;
+    case 'mcp': {
+      const { startMcpServer } = await import('../src/mcp.mjs');
+      startMcpServer();
+      break;
+    }
+    case 'token': {
+      const token = loadToken();
+      if (!args.includes('--copy')) {
+        console.log(token);
+      } else if (copy(token)) {
+        console.log('Token copied to the clipboard.');
+      } else {
+        console.log('No clipboard tool found. From the machine with Chrome, pipe it into its clipboard instead, e.g.\n  ssh <this machine> browser-relay token | pbcopy');
+        process.exitCode = 1;
+      }
+      break;
+    }
+    case 'status': {
+      try {
+        const res = await fetch(relayUrl('/health'), { headers: auth(), signal: AbortSignal.timeout(1000) });
+        console.log(res.ok ? JSON.stringify(await res.json()) : `relay answered ${res.status}`);
+      } catch {
+        console.log('relay not running');
+        process.exitCode = 1;
+      }
+      break;
+    }
+    case 'stop': {
+      try {
+        await fetch(relayUrl('/shutdown'), { method: 'POST', headers: auth(), signal: AbortSignal.timeout(1000) });
+        console.log('relay stopped');
+      } catch {
+        console.log('relay not running');
+      }
+      break;
+    }
+    case 'remote': {
+      const { remoteCommand } = await import('../src/remote.mjs');
+      await remoteCommand(args);
+      break;
+    }
+    case 'service': {
+      const { serviceCommand } = await import('../src/remote.mjs');
+      await serviceCommand(args);
+      break;
+    }
+    default:
+      console.log(USAGE);
+      process.exitCode = command ? 1 : 0;
   }
-  default:
-    console.log(USAGE);
-    process.exitCode = command ? 1 : 0;
+} catch (err) {
+  console.error(`browser-relay ${command}: ${err.message}`);
+  process.exitCode = 1;
 }
