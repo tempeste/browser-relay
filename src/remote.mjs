@@ -34,7 +34,7 @@ function tailnetName() {
   const self = JSON.parse(tailscale('status', '--json')).Self;
   const name = self?.DNSName?.replace(/\.$/, '');
   if (!name) throw new Error('This machine has no MagicDNS name. Enable MagicDNS and HTTPS certificates for the tailnet.');
-  return { name: name.toLowerCase(), host: self.HostName };
+  return { name: name.toLowerCase(), host: name.toLowerCase().split('.')[0] };
 }
 
 // What `tailscale serve` currently does with one HTTPS port on this machine.
